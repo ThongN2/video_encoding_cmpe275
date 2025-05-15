@@ -1,70 +1,90 @@
-# Getting Started with Create React App
+Here's the updated `README.md` including:
 
-This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
+* Instructions for setting up and running both the **frontend React app** and the **Flask backend**
+* Information about the gRPC master port
+* A preview image of the final interface
+![alt text](image-1.png)
+---
 
-## Available Scripts
+````markdown
+# Distributed Video Encoder
 
-In the project directory, you can run:
+A simple distributed system that allows users to upload and process video files using gRPC-based segmentation and worker nodes. This interface is built with **React** for the frontend and **Flask** for the backend, integrating with a gRPC master-worker pipeline.
 
-### `npm start`
+---
 
-Runs the app in the development mode.\
-Open [http://localhost:3000](http://localhost:3000) to view it in your browser.
+## 🔧 Features
 
-The page will reload when you make changes.\
-You may also see any lint errors in the console.
+- ✅ Upload video and track real-time status
+- 🔄 Automatic polling for processing updates
+- 🎞️ Video preview + download when complete
+- 📏 Customize resolution and output format
+- 📦 Modular, scalable with gRPC Master-Worker backend
 
-### `npm test`
+---
 
-Launches the test runner in the interactive watch mode.\
-See the section about [running tests](https://facebook.github.io/create-react-app/docs/running-tests) for more information.
+## 🖥️ Run the Frontend
 
-### `npm run build`
+Make sure you have `npm` installed. Then:
 
-Builds the app for production to the `build` folder.\
-It correctly bundles React in production mode and optimizes the build for the best performance.
+```bash
+cd frontend
+npm install
+npm start
+````
 
-The build is minified and the filenames include the hashes.\
-Your app is ready to be deployed!
+> App will open at [http://localhost:3000](http://localhost:3000)
 
-See the section about [deployment](https://facebook.github.io/create-react-app/docs/deployment) for more information.
+---
 
-### `npm run eject`
+## 🧪 Run the Flask Backend
 
-**Note: this is a one-way operation. Once you `eject`, you can't go back!**
+This Flask server acts as a bridge between the React frontend and the gRPC Master node.
 
-If you aren't satisfied with the build tool and configuration choices, you can `eject` at any time. This command will remove the single build dependency from your project.
+### Step 1 – Install Requirements
 
-Instead, it will copy all the configuration files and the transitive dependencies (webpack, Babel, ESLint, etc) right into your project so you have full control over them. All of the commands except `eject` will still work, but they will point to the copied scripts so you can tweak them. At this point you're on your own.
+```bash
+pip install flask flask-cors grpcio grpcio-tools
+```
 
-You don't have to ever use `eject`. The curated feature set is suitable for small and middle deployments, and you shouldn't feel obligated to use this feature. However we understand that this tool wouldn't be useful if you couldn't customize it when you are ready for it.
+### Step 2 – Edit the gRPC Master Address
 
-## Learn More
+In `flask_server.py`, update this line:
 
-You can learn more in the [Create React App documentation](https://facebook.github.io/create-react-app/docs/getting-started).
+```python
+GRPC_MASTER_ADDRESS = 'localhost:50053'  # ← Change this to match your running Master node port
+```
 
-To learn React, check out the [React documentation](https://reactjs.org/).
+### Step 3 – Run the Flask API Server
 
-### Code Splitting
+```bash
+python flask_server.py
+```
 
-This section has moved here: [https://facebook.github.io/create-react-app/docs/code-splitting](https://facebook.github.io/create-react-app/docs/code-splitting)
+It runs by default at: [http://localhost:8000](http://localhost:8000)
 
-### Analyzing the Bundle Size
+---
 
-This section has moved here: [https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size](https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size)
+## 🚀 Start Master Node & Worker(s)
 
-### Making a Progressive Web App
+Make sure you have compiled your `replication.proto` file:
 
-This section has moved here: [https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app](https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app)
+```bash
+python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. replication.proto
+```
 
-### Advanced Configuration
+### Start Master
 
-This section has moved here: [https://facebook.github.io/create-react-app/docs/advanced-configuration](https://facebook.github.io/create-react-app/docs/advanced-configuration)
+```bash
+python node.py --role master --port 50053
+```
 
-### Deployment
+### Start Worker
 
-This section has moved here: [https://facebook.github.io/create-react-app/docs/deployment](https://facebook.github.io/create-react-app/docs/deployment)
+```bash
+python node.py --role worker --port 50054 --master localhost:50053
+```
 
-### `npm run build` fails to minify
+> Start multiple workers by changing the `--port`.
 
-This section has moved here: [https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify](https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify)
+---
