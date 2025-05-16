@@ -1,4 +1,10 @@
+import sys
 import asyncio
+
+# Set event loop policy for macOS
+if sys.platform == "darwin":
+    asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+
 import grpc
 import replication_pb2
 import replication_pb2_grpc
@@ -13,7 +19,6 @@ import glob
 from concurrent import futures
 from typing import Dict, List, Any, Tuple, Optional, AsyncIterator
 import shutil
-import sys
 import psutil
 import ffmpeg
 import random
@@ -167,12 +172,27 @@ class Node:
     
     
     async def _register_with_master(self):
-        try:
-            req  = replication_pb2.RegisterWorkerRequest(worker_address=self.address)
-            resp = await self.master_stub.RegisterWorker(req)
-            logging.info(f"[{self.address}] Registered with master: {resp.message}")
-        except Exception as e:
-            logging.error(f"[{self.address}] Failed to register with master: {e}")
+        retry_interval = 3  # seconds
+        max_attempts = 100  # or set to None for infinite retries
+        attempts = 0
+
+        while self.role == 'worker' and self.current_master_address:
+            try:
+                req = replication_pb2.RegisterWorkerRequest(worker_address=self.address)
+                resp = await self.master_stub.RegisterWorker(req)
+                logging.info(f"[{self.address}] Successfully registered with master: {resp.message}")
+                return  # Exit loop on success
+            except grpc.aio.AioRpcError as e:
+                logging.warning(f"[{self.address}] Master unavailable, retrying in {retry_interval}s: {e.details()}")
+            except Exception as e:
+                logging.error(f"[{self.address}] Error while registering with master: {e}")
+
+            attempts += 1
+            if max_attempts and attempts >= max_attempts:
+                logging.error(f"[{self.address}] Max retry attempts reached while registering with master.")
+                break
+            await asyncio.sleep(retry_interval)
+
 
     async def start(self):
         """Starts the gRPC server and background routines."""
