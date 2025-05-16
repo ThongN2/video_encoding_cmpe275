@@ -98,8 +98,6 @@ class Node:
                 self._create_stubs_for_node(node_addr)
 
         if self.role == 'worker' and self.current_master_address:
-            logging.info(f"[{self.address}] Creating/Updating MasterService stubs for {self.current_master_address}")
-            self._create_master_stubs(self.current_master_address)
             task = asyncio.create_task(self._register_with_master())
             self._background_tasks.append(task)
 
@@ -167,30 +165,37 @@ class Node:
     
     
     async def _register_with_master(self):
-        retry_interval_base = 2   # initial delay in seconds
-        max_backoff = 60          # max wait time between retries
-        max_attempts = None       # None = retry indefinitely
-        attempts = 0
-
+        retry_interval = 3
         while self.role == 'worker' and self.current_master_address:
             try:
-                req = replication_pb2.RegisterWorkerRequest(worker_address=self.address)
-                resp = await self.master_stub.RegisterWorker(req)
-                logging.info(f"[{self.address}] ✅ Successfully registered with master: {resp.message}")
-                return  # Exit loop on success
+                # if there's an old channel, close it
+                if self._master_channel:
+                    await self._master_channel.close()
+
+                # recreate channel & stub every time
+                self._master_channel = grpc.aio.insecure_channel(
+                    self.current_master_address,
+                    options=[
+                        ('grpc.max_send_message_length', MAX_GRPC_MESSAGE_LENGTH),
+                        ('grpc.max_receive_message_length', MAX_GRPC_MESSAGE_LENGTH),
+                    ]
+                )
+                self.master_stub = replication_pb2_grpc.MasterServiceStub(self._master_channel)
+
+                # now this will wait until the channel can actually connect
+                resp = await self.master_stub.RegisterWorker(
+                    replication_pb2.RegisterWorkerRequest(worker_address=self.address),
+                    timeout=15,                 # a reasonable per-call timeout
+                    wait_for_ready=True        # block until the server is up
+                )
+                logging.info(f"Registered with master: {resp.message}")
+                return
 
             except grpc.aio.AioRpcError as e:
-                logging.warning(f"[{self.address}]  Master unavailable (attempt {attempts + 1}): {e.details()}")
+                logging.warning(f"Master unavailable, retrying in {retry_interval}s: {e.details()}")
             except Exception as e:
-                logging.error(f"[{self.address}] Error while registering with master (attempt {attempts + 1}): {type(e).__name__} - {e}", exc_info=True)
+                logging.error(f"Unexpected error: {e}")
 
-            attempts += 1
-            if max_attempts is not None and attempts >= max_attempts:
-                logging.error(f"[{self.address}] Max retry attempts reached while registering with master.")
-                break
-
-            retry_interval = min(max_backoff, retry_interval_base * (2 ** attempts))
-            logging.info(f"[{self.address}] ⏳ Waiting {retry_interval:.1f}s before retrying registration...")
             await asyncio.sleep(retry_interval)
 
 
