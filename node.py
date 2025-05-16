@@ -22,7 +22,7 @@ import shutil
 import psutil
 import ffmpeg
 import random
-
+  
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -62,54 +62,49 @@ class Node:
         self.last_heartbeat_time = time.monotonic()
         self.state = "follower"
 
-        # Store references to background tasks for cancellation
         self._background_tasks: List[asyncio.Task] = []
-        self._election_task: Optional[asyncio.Task] = None
-        self._pre_election_delay_task: Optional[asyncio.Task] = None
-        self._master_announcement_task: Optional[asyncio.Task] = None
-        self._other_nodes_health_check_task: Optional[asyncio.Task] = None
-        self._master_health_check_task: Optional[asyncio.Task] = None
+        self._election_task = None
+        self._pre_election_delay_task = None
+        self._master_announcement_task = None
+        self._other_nodes_health_check_task = None
+        self._master_health_check_task = None
 
+        self.video_statuses = {}
+        self.processing_tasks = {}
+        self._unreported_processed_shards = {}
 
-        self.video_statuses: Dict[str, Dict[str, Any]] = {}
+        self._server = None
+        self._channels = {}
+        self._node_stubs = {}
+        self._worker_stubs = {}
 
-        self.processing_tasks: Dict[str, asyncio.Task] = {}
-        self._unreported_processed_shards: Dict[Tuple[str, str], str] = {}
-
-        self._server: Optional[grpc.aio.Server] = None
-        self._channels: Dict[str, grpc.aio.Channel] = {}
-        self._node_stubs: Dict[str, replication_pb2_grpc.NodeServiceStub] = {}
-        self._worker_stubs: Dict[str, replication_pb2_grpc.WorkerServiceStub] = {}
-
-        self.master_stub: Optional[replication_pb2_grpc.MasterServiceStub] = None
-        self._master_channel: Optional[grpc.ServiceChannel] = None
-        self._master_channel_address: Optional[str] = None
-
+        self.master_stub = None
+        self._master_channel = None
+        self._master_channel_address = None
 
         self._master_service_added = False
         self._worker_service_added = False
 
         self.known_nodes = list(set(known_nodes))
         if self.address in self.known_nodes:
-             self.known_nodes.remove(self.address)
+            self.known_nodes.remove(self.address)
 
         self.current_master_address = master_address
 
         logging.info(f"[{self.address}] Starting as {self.role.upper()}. Explicit master: {master_address}")
 
         for node_addr in self.known_nodes:
-             if node_addr != self.address:
+            if node_addr != self.address:
                 self._create_stubs_for_node(node_addr)
 
         if self.role == 'worker' and self.current_master_address:
             logging.info(f"[{self.address}] Creating/Updating MasterService stubs for {self.current_master_address}")
             self._create_master_stubs(self.current_master_address)
-
-            # let master know we exist
-            asyncio.create_task(self._register_with_master())
-
+            task = asyncio.create_task(self._register_with_master())
+            self._background_tasks.append(task)
 
         logging.info(f"[{self.address}] Initialized as {self.role.upper()}. Master is {self.current_master_address}. My ID: {self.id}. Current Term: {self.current_term}")
+
 
     def _get_or_create_channel(self, node_address: str) -> grpc.aio.Channel:
         """Gets an existing channel or creates a new one."""
@@ -172,26 +167,32 @@ class Node:
     
     
     async def _register_with_master(self):
-        retry_interval = 3  # seconds
-        max_attempts = 100  # or set to None for infinite retries
+        retry_interval_base = 2   # initial delay in seconds
+        max_backoff = 60          # max wait time between retries
+        max_attempts = None       # None = retry indefinitely
         attempts = 0
 
         while self.role == 'worker' and self.current_master_address:
             try:
                 req = replication_pb2.RegisterWorkerRequest(worker_address=self.address)
                 resp = await self.master_stub.RegisterWorker(req)
-                logging.info(f"[{self.address}] Successfully registered with master: {resp.message}")
+                logging.info(f"[{self.address}] ✅ Successfully registered with master: {resp.message}")
                 return  # Exit loop on success
+
             except grpc.aio.AioRpcError as e:
-                logging.warning(f"[{self.address}] Master unavailable, retrying in {retry_interval}s: {e.details()}")
+                logging.warning(f"[{self.address}]  Master unavailable (attempt {attempts + 1}): {e.details()}")
             except Exception as e:
-                logging.error(f"[{self.address}] Error while registering with master: {e}")
+                logging.error(f"[{self.address}] Error while registering with master (attempt {attempts + 1}): {type(e).__name__} - {e}", exc_info=True)
 
             attempts += 1
-            if max_attempts and attempts >= max_attempts:
+            if max_attempts is not None and attempts >= max_attempts:
                 logging.error(f"[{self.address}] Max retry attempts reached while registering with master.")
                 break
+
+            retry_interval = min(max_backoff, retry_interval_base * (2 ** attempts))
+            logging.info(f"[{self.address}] ⏳ Waiting {retry_interval:.1f}s before retrying registration...")
             await asyncio.sleep(retry_interval)
+
 
 
     async def start(self):
