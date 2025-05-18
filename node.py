@@ -57,6 +57,8 @@ class Node:
         self.last_heartbeat_time = time.monotonic()
         self.state = "follower"
 
+        self.current_backup_master_address = None
+
         # Store references to background tasks for cancellation
         self._background_tasks: List[asyncio.Task] = []
         self._election_task: Optional[asyncio.Task] = None
@@ -111,7 +113,9 @@ class Node:
 
             # let master know we exist
             asyncio.create_task(self.retry_register_with_master())
-
+        
+        if self.role == 'backup_master':
+            logging.info(f"[{self.address}] Starting as BACKUP MASTER. Primary master: {master_address}")
 
         logging.info(f"[{self.address}] Initialized as {self.role.upper()}. Master is {self.current_master_address}. My ID: {self.id}. Current Term: {self.current_term}")
 
@@ -127,6 +131,16 @@ class Node:
                  ]
              )
         return self._channels[node_address]
+    
+    async def retry_register_with_master(self):
+        """Tries to register with the master repeatedly until successful or shutdown."""
+        while not getattr(self, '_shutdown_flag', False):
+            try:
+                await self._register_with_master()
+                return  # Success!
+            except Exception as e:
+                logging.warning(f"[{self.address}] Retry register failed: {e}")
+                await asyncio.sleep(5)
 
     def _create_stubs_for_node(self, node_address: str):
         """Creates stubs with retry logic"""
@@ -376,125 +390,111 @@ class Node:
         logging.info(f"[{self.address}] Node shutdown complete.")
 
     async def AnnounceMaster(self, request: replication_pb2.MasterAnnouncement, context: grpc.aio.ServicerContext) -> replication_pb2.MasterAnnouncementResponse:
-        """Handles incoming MasterAnnouncement RPCs."""
-        logging.info(f"[{self.address}] Received MasterAnnouncement from {context.peer()}. New master is {request.master_address} (ID: {request.node_id_of_master}, Term: {request.term})")
+        """
+        Handles incoming MasterAnnouncement RPCs, including backup master logic.
+        """
+        logging.info(
+            f"[{self.address}] Received MasterAnnouncement from {context.peer()}."
+            f" Master: {request.master_address},"
+            f" Backup: {getattr(request, 'backup_master_address', None)},"
+            f" Term: {request.term}"
+        )
 
+        # --- Always update master and backup addresses ---
+        self.current_master_address = request.master_address
+        self.current_backup_master_address = getattr(request, "backup_master_address", None) or None
+
+        # --- Decide and set this node's role ---
+        if self.address == self.current_master_address:
+            self.role = "master"
+            logging.info(f"[{self.address}] I am now the MASTER.")
+        elif self.current_backup_master_address and self.address == self.current_backup_master_address:
+            self.role = "backup_master"
+            logging.info(f"[{self.address}] I am now the BACKUP MASTER.")
+            # Optional: Start replication routine here if needed
+            # asyncio.create_task(self._backup_replication_routine())
+        else:
+            self.role = "worker"
+            logging.info(f"[{self.address}] I am a WORKER.")
+
+        # --- Election and heartbeat logic ---
+        # (retain your existing term/state handling as appropriate)
         if request.term > self.current_term:
-             logging.info(f"[{self.address}] Received MasterAnnouncement with higher term ({request.term} > {self.current_term}). Updating term and reverting to follower.")
-             self.current_term = request.term
-             self.state = "follower"
-             self.voted_for = None
-             self.current_master_address = request.master_address
-             self.leader_address = request.master_address # Assuming master is leader in this model
-             self.last_heartbeat_time = time.monotonic()
-             self.role = 'worker' # A non-master receiving higher term becomes worker
+            logging.info(f"[{self.address}] Received MasterAnnouncement with higher term ({request.term} > {self.current_term}). Updating term and reverting to follower.")
+            self.current_term = request.term
+            self.state = "follower"
+            self.voted_for = None
+            self.leader_address = request.master_address
+            self.last_heartbeat_time = time.monotonic()
 
-             logging.info(f"[{self.address}] Updating Master stubs to point to {request.master_address} and attempting to report unreported shards.")
-             self._create_master_stubs(request.master_address)
-             asyncio.create_task(self._attempt_report_unreported_shards())
+            self._create_master_stubs(request.master_address)
+            asyncio.create_task(self._attempt_report_unreported_shards())
 
-             # Cancel any pending election/announcement tasks as we are now a follower
-             if self._election_task and not self._election_task.done():
-                  logging.info(f"[{self.address}] Cancelling pending election task due to new master announcement.")
-                  self._election_task.cancel()
-                  self._election_task = None
-             if self._pre_election_delay_task and not self._pre_election_delay_task.done():
-                  logging.info(f"[{self.address}] Cancelling pending pre-election delay due to new master announcement.")
-                  self._pre_election_delay_task.cancel()
-                  self._pre_election_delay_task = None
-             if self._master_announcement_task and not self._master_announcement_task.done():
-                  logging.info(f"[{self.address}] Cancelling master announcement task.")
-                  self._master_announcement_task.cancel()
-                  self._master_announcement_task = None
-             if self._other_nodes_health_check_task and not self._other_nodes_health_check_task.done():
-                  logging.info(f"[{self.address}] Cancelling other nodes health check task.")
-                  self._other_nodes_health_check_task.cancel()
-                  self._other_nodes_health_check_task = None
-
-             # Ensure master health check is running if we are a worker
-             if self.role == 'worker' and (self._master_health_check_task is None or self._master_health_check_task.done()):
-                  logging.info(f"[{self.address}] Starting master health check routine.")
-                  self._master_health_check_task = asyncio.create_task(self.check_master_health())
-                  self._background_tasks.append(self._master_health_check_task)
-
+            # Cancel pending tasks for elections/announcements
+            if self._election_task and not self._election_task.done():
+                self._election_task.cancel()
+                self._election_task = None
+            if self._pre_election_delay_task and not self._pre_election_delay_task.done():
+                self._pre_election_delay_task.cancel()
+                self._pre_election_delay_task = None
+            if self._master_announcement_task and not self._master_announcement_task.done():
+                self._master_announcement_task.cancel()
+                self._master_announcement_task = None
+            if self._other_nodes_health_check_task and not self._other_nodes_health_check_task.done():
+                self._other_nodes_health_check_task.cancel()
+                self._other_nodes_health_check_task = None
 
         elif request.term == self.current_term:
-             if self.state == "follower":
-                 logging.info(f"[{self.address}] Received MasterAnnouncement with equal term ({request.term}) while in follower state. Accepting as heartbeat.")
-                 self.current_master_address = request.master_address
-                 self.leader_address = request.master_address
-                 self.last_heartbeat_time = time.monotonic()
-                 if self.role == 'worker':
-                    logging.info(f"[{self.address}] Updating Master stubs to point to {request.master_address} and attempting to report unreported shards.")
+            if self.state == "follower":
+                self.leader_address = request.master_address
+                self.last_heartbeat_time = time.monotonic()
+                if self.role == "worker":
                     self._create_master_stubs(request.master_address)
                     asyncio.create_task(self._attempt_report_unreported_shards())
-
-             elif self.state == "candidate":
-                 logging.warning(f"[{self.address}] Received MasterAnnouncement with equal term ({request.term}) while in candidate state. Stepping down to follower.")
-                 self.state = "follower"
-                 self.voted_for = None
-                 self.current_master_address = request.master_address
-                 self.leader_address = request.master_address
-                 self.last_heartbeat_time = time.monotonic()
-                 self.role = 'worker'
-
-                 logging.info(f"[{self.address}] Updating Master stubs to point to {request.master_address} and attempting to report unreported shards.")
-                 self._create_master_stubs(request.master_address)
-                 asyncio.create_task(self._attempt_report_unreported_shards())
-
-                 if self._pre_election_delay_task and not self._pre_election_delay_task.done():
-                      logging.info(f"[{self.address}] Cancelling pending pre-election delay due to stepping down from candidate.")
-                      self._pre_election_delay_task.cancel()
-                      self._pre_election_delay_task = None
-                 if self._election_task and not self._election_task.done():
-                      logging.info(f"[{self.address}] Cancelling pending election task.")
-                      self._election_task.cancel()
-                      self._election_task = None
-
-                 # Ensure master health check is running if we are a worker
-                 if self.role == 'worker' and (self._master_health_check_task is None or self._master_health_check_task.done()):
-                      logging.info(f"[{self.address}] Starting master health check routine.")
-                      self._master_health_check_task = asyncio.create_task(self.check_master_health())
-                      self._background_tasks.append(self._master_health_check_task)
-
-
-             elif self.state == "leader":
-                 logging.warning(f"[{self.address}] Received MasterAnnouncement with equal term ({request.term}) while in leader state. Potential split-brain. Ignoring announcement and continuing as leader.")
+            elif self.state == "candidate":
+                self.state = "follower"
+                self.voted_for = None
+                self.leader_address = request.master_address
+                self.last_heartbeat_time = time.monotonic()
+                if self.role == "worker":
+                    self._create_master_stubs(request.master_address)
+                    asyncio.create_task(self._attempt_report_unreported_shards())
+                if self._pre_election_delay_task and not self._pre_election_delay_task.done():
+                    self._pre_election_delay_task.cancel()
+                    self._pre_election_delay_task = None
+                if self._election_task and not self._election_task.done():
+                    self._election_task.cancel()
+                    self._election_task = None
+            elif self.state == "leader":
+                logging.warning(f"[{self.address}] Received MasterAnnouncement with equal term ({request.term}) while in leader state. Potential split-brain. Ignoring announcement and continuing as leader.")
 
         elif request.term < self.current_term:
-             if self.current_master_address is not None:
-                 logging.info(f"[{self.address}] Received MasterAnnouncement with lower term ({request.term} < {self.current_term}). Ignoring.")
-             else:
-                 logging.warning(f"[{self.address}] Received MasterAnnouncement with lower term ({request.term} < {self.current_term}) but I don't know a master. Accepting for now to discover a master.")
-                 self.current_term = request.term
-                 self.state = "follower"
-                 self.voted_for = None
-                 self.current_master_address = request.master_address
-                 self.leader_address = request.master_address # Assuming master is leader in this model
-                 self.last_heartbeat_time = time.monotonic()
-                 self.role = 'worker'
+            if self.current_master_address is not None:
+                logging.info(f"[{self.address}] Received MasterAnnouncement with lower term ({request.term} < {self.current_term}). Ignoring.")
+            else:
+                logging.warning(f"[{self.address}] Received MasterAnnouncement with lower term but I don't know a master. Accepting for now.")
+                self.current_term = request.term
+                self.state = "follower"
+                self.voted_for = None
+                self.leader_address = request.master_address
+                self.last_heartbeat_time = time.monotonic()
+                self._create_master_stubs(request.master_address)
+                asyncio.create_task(self._attempt_report_unreported_shards())
+                if self._pre_election_delay_task and not self._pre_election_delay_task.done():
+                    self._pre_election_delay_task.cancel()
+                    self._pre_election_delay_task = None
 
-                 logging.info(f"[{self.address}] Updating Master stubs to point to {request.master_address} and attempting to report unreported shards.")
-                 self._create_master_stubs(request.master_address)
-                 asyncio.create_task(self._attempt_report_unreported_shards())
+        # --- Start health checks for worker or backup master ---
+        if self.role in ['worker', 'backup_master'] and (self._master_health_check_task is None or self._master_health_check_task.done()):
+            logging.info(f"[{self.address}] Starting master health check routine as {self.role}.")
+            self._master_health_check_task = asyncio.create_task(self.check_master_health())
+            self._background_tasks.append(self._master_health_check_task)
 
-                 if self._pre_election_delay_task and not self._pre_election_delay_task.done():
-                      logging.info(f"[{self.address}] Cancelling pending pre-election delay due to accepting lower term announcement (no master known).")
-                      self._pre_election_delay_task.cancel()
-                      self._pre_election_delay_task = None
-
-                 # Ensure master health check is running if we are a worker
-                 if self.role == 'worker' and (self._master_health_check_task is None or self._master_health_check_task.done()):
-                      logging.info(f"[{self.address}] Starting master health check routine.")
-                      self._master_health_check_task = asyncio.create_task(self.check_master_health())
-                      self._background_tasks.append(self._master_health_check_task)
-
-
-        response = replication_pb2.MasterAnnouncementResponse(
+        return replication_pb2.MasterAnnouncementResponse(
             status=f"Acknowledged by {self.id}",
             node_id=self.id
         )
-        return response
+
 
     async def RequestVote(self, request: replication_pb2.VoteRequest, context: grpc.aio.ServicerContext) -> replication_pb2.VoteResponse:
         """Handles incoming VoteRequest RPCs with improved tiebreaking."""
@@ -504,7 +504,7 @@ class Node:
         if request.term < self.current_term:
             logging.info(f"[{self.address}] Rejecting vote: candidate term {request.term} < our term {self.current_term}")
             return replication_pb2.VoteResponse(term=self.current_term, vote_granted=False, voter_id=self.address)
-            
+
         # If candidate's term is greater, update our term and become follower
         if request.term > self.current_term:
             logging.info(f"[{self.address}] Candidate has higher term {request.term} > {self.current_term}, updating term")
@@ -514,30 +514,29 @@ class Node:
             self.leader_address = None
             self.current_master_address = None
             self.last_heartbeat_time = time.monotonic()  # Reset election timeout
-            
-        # Vote if we haven't voted yet in this term or already voted for this candidate
-        if (self.voted_for is None or self.voted_for == request.candidate_id) and request.term >= self.current_term:
-            vote_granted = False
 
-            if not self.score_valid:
-                # If somehow we don't have a valid score, calculate once
-                self.calculate_server_score()
-            my_score = self.current_score["score"]
-            # THREE-TIER DECISION LOGIC:
+        # Always calculate your score at vote time
+        if not hasattr(self, 'score_valid') or not self.score_valid:
+            self.calculate_server_score()
+        my_score = self.current_score["score"]
+
+        vote_granted = False
+        if (self.voted_for is None or self.voted_for == request.candidate_id) and request.term >= self.current_term:
             # 1. Compare scores - lower is better
             if request.score < my_score:
                 vote_granted = True
                 logging.info(f"[{self.address}] Granting vote: candidate score {request.score} < our score {my_score}")
-            # 2. If scores equal, use lexicographical ordering of addresses as tiebreaker
-            elif abs(request.score - my_score) < 0.001:  # Small epsilon for float comparison
-                if request.candidate_id < self.address:  # Deterministic tiebreaker
+            # 2. If scores are (almost) equal, use strict tiebreaker: only grant if candidate_id is LESS than ours
+            elif abs(request.score - my_score) < 0.001:
+                if request.candidate_id < self.address:
                     vote_granted = True
                     logging.info(f"[{self.address}] Granting vote: tied score but candidate ID {request.candidate_id} < our ID {self.address}")
                 else:
-                    logging.info(f"[{self.address}] Rejecting vote: tied score but candidate ID {request.candidate_id} >= our ID {self.address}")
+                    vote_granted = False
+                    logging.info(f"[{self.address}] Rejecting vote: tied score and candidate ID {request.candidate_id} >= our ID {self.address}")
             else:
                 logging.info(f"[{self.address}] Rejecting vote: candidate score {request.score} > our score {my_score}")
-            
+
             if vote_granted:
                 self.voted_for = request.candidate_id
                 self.last_heartbeat_time = time.monotonic()
@@ -545,7 +544,12 @@ class Node:
             vote_granted = False
             logging.info(f"[{self.address}] Already voted for {self.voted_for} in term {self.current_term}, rejecting")
 
-        return replication_pb2.VoteResponse(term=self.current_term, vote_granted=vote_granted, voter_id=self.address)
+        return replication_pb2.VoteResponse(
+            term=self.current_term,
+            vote_granted=vote_granted,
+            voter_id=self.address,
+            voter_score=my_score  # Send own score
+        )
 
     def reset_election_timer(self):
         """Resets election timer with exponential randomized backoff"""
@@ -608,6 +612,43 @@ class Node:
             current_term=self.current_term
         )
         return response
+     
+    async def _master_election_announcement_routine(self):
+        """Periodically announces this node as the master."""
+        while self.role == 'master':
+            logging.info(f"[{self.address}] Announcing self as master (Term: {self.current_term}).")
+            announcement = replication_pb2.MasterAnnouncement(
+                master_address=self.address,
+                backup_master_address=getattr(self, 'backup_master_address', "") or "",
+                node_id_of_master=getattr(self, 'id', ""),
+                term=self.current_term
+            )
+            for node_addr in list(getattr(self, '_node_stubs', {})):
+                if node_addr == self.address:
+                    continue
+                try:
+                    await self._send_master_announcement(node_addr, announcement)
+                except Exception as e:
+                    logging.warning(f"[{self.address}] MasterAnnouncement to {node_addr} failed: {e}")
+                    if hasattr(self, '_node_stubs'):
+                        self._node_stubs.pop(node_addr, None)
+                    if hasattr(self, '_worker_stubs'):
+                        self._worker_stubs.pop(node_addr, None)
+                    if hasattr(self, '_channels'):
+                        self._channels.pop(node_addr, None)
+            await asyncio.sleep(5)
+        logging.info(f"[{self.address}] Master announcement routine stopped.")
+
+        def _validate_stub(self, node_addr: str) -> bool:
+            """Returns True if stub is valid and connected"""
+            if node_addr not in self._node_stubs:
+                return False
+            try:
+                # Check channel state
+                channel = self._node_stubs[node_addr].channel
+                return channel.get_state(try_to_connect=True) == grpc.ChannelConnectivity.READY
+            except Exception:
+                return False
 
     async def GetCurrentMaster(self, request: replication_pb2.GetCurrentMasterRequest, context: grpc.aio.ServicerContext) -> replication_pb2.GetCurrentMasterResponse:
         """Provides the address and term of the current master."""
@@ -668,6 +709,137 @@ class Node:
         self.score_last_updated = time.monotonic()
         
         return self.current_score
+    
+    async def start_election(self):
+        """Initiates leader election and selects backup master based on node scores."""
+        if self.state == "leader":
+            return
+
+        # --- Step 1: Calculate self score ---
+        score_data = self.calculate_server_score()
+        my_score = score_data["score"]
+
+        # --- Step 2: Pre-election backoff if better nodes exist ---
+        better_nodes = []
+        for node_addr in self.known_nodes:
+            if node_addr == self.address:
+                continue
+            if not self._validate_stub(node_addr):
+                continue
+            try:
+                node_stub = self._node_stubs.get(node_addr)
+                if node_stub:
+                    response = await asyncio.wait_for(
+                        node_stub.GetNodeStats(replication_pb2.NodeStatsRequest()), timeout=2
+                    )
+                    node_score = response.cpu_utilization  # Use as score
+                    if node_score < my_score:
+                        better_nodes.append((node_addr, node_score))
+            except Exception:
+                continue
+
+        if better_nodes:
+            logging.info(f"[{self.address}] Found {len(better_nodes)} better-scoring nodes, delaying election")
+            await asyncio.sleep(random.uniform(8, 12))
+            if self.state != "follower" or self._pre_election_delay_task is not None:
+                logging.info(f"[{self.address}] Election already started by another node, aborting")
+                return
+
+        # --- Step 3: Become candidate, prepare for election ---
+        self.state = "candidate"
+        self.current_term += 1
+        self.voted_for = self.address
+        self.votes_received = 1  # Vote for self
+
+        failed_master = self.current_master_address
+        self.leader_address = None
+        self.current_master_address = None
+
+        logging.info(f"[{self.address}] Starting election for term {self.current_term}")
+
+        # --- Step 4: Prepare VoteRequest ---
+        request = replication_pb2.VoteRequest(
+            term=self.current_term,
+            candidate_id=self.address,
+            score=my_score
+        )
+
+        alive_nodes = [addr for addr in self.known_nodes if addr != failed_master and addr != self.address]
+        vote_tasks = []
+        for node_addr in alive_nodes:
+            if node_addr == failed_master:
+                continue
+            if node_addr != self.address:
+                if node_addr == self.current_master_address and self.current_master_address is None:
+                    continue
+                node_stub = self._node_stubs.get(node_addr)
+                if node_stub:
+                    try:
+                        logging.info(f"[{self.address}] Sending vote request to {node_addr}")
+                        task = asyncio.create_task(
+                            self._send_request_vote(node_stub, request, node_addr)
+                        )
+                        vote_tasks.append(task)
+                    except Exception as e:
+                        logging.error(f"[{self.address}] Error creating vote request for {node_addr}: {e}")
+
+        # --- Step 5: If no peers, just become master (solo mode) ---
+        if not vote_tasks:
+            logging.info(f"[{self.address}] No other nodes to request votes from, becoming leader")
+            self.backup_master_address = None
+            await self._become_master()
+            return
+
+        # --- Step 6: Collect voter scores from VoteResponses ---
+        vote_results = []  # (address, score)
+        results = await asyncio.gather(*vote_tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                logging.error(f"[{self.address}] Exception during vote request: {result}")
+                continue
+
+            if self.state != "candidate":
+                return
+
+            if result.term > self.current_term:
+                self.current_term = result.term
+                self.state = "follower"
+                self.voted_for = None
+                self.last_heartbeat_time = time.monotonic()
+                return
+
+            if result.vote_granted:
+                self.votes_received += 1
+                logging.info(f"[{self.address}] Received vote from {result.voter_id}, total: {self.votes_received}")
+                vote_results.append((result.voter_id, result.voter_score))
+
+        # Always include self!
+        vote_results.append((self.address, my_score))
+
+        # --- Step 7: Elect master/backup by best (lowest) score ---
+        total_nodes = len(self.known_nodes) + 1  # +1 for self
+        if self.votes_received > total_nodes / 2:
+            logging.info(f"[{self.address}] Won election with {self.votes_received} votes out of {total_nodes}")
+
+            # Sort all (address, score) by score ascending (best is first)
+            sorted_votes = sorted(vote_results, key=lambda x: x[1])
+            master_addr = sorted_votes[0][0]
+            backup_addr = sorted_votes[1][0] if len(sorted_votes) > 1 else None
+
+            # Store backup for announcement/routines
+            self.backup_master_address = backup_addr
+            logging.info(f"[{self.address}] Elected backup master: {backup_addr}")
+
+            # You could store the entire vote_results if you want later diagnostics
+            self.node_scores = vote_results
+
+            await self._become_master()
+        else:
+            self.state = "follower"
+            if self._master_health_check_task is None or self._master_health_check_task.done():
+                logging.info(f"[{self.address}] Restarting master health check after failed election")
+                self._master_health_check_task = asyncio.create_task(self.check_master_health())
+                self._background_tasks.append(self._master_health_check_task)
     
     async def ReportResourceScore(self, request: replication_pb2.ReportResourceScoreRequest, context: grpc.aio.ServicerContext) -> replication_pb2.ReportResourceScoreResponse:
         """Handles incoming resource scores from workers."""
@@ -1685,132 +1857,7 @@ class Node:
             # pause a bit (with jitter) before next sweep
             await asyncio.sleep(HEALTH_INTERVAL + random.uniform(0, JITTER))
 
-    async def start_election(self):
-        """Initiates leader election with improved coordination"""
-        if self.state == "leader":
-            return
-        
-        # Calculate our score
-        score_data = self.calculate_server_score()
-        my_score = score_data["score"]
-        # Before becoming a candidate, verify if we should run at all
-        
-        # Check if there are better-scoring nodes that should be leaders instead
-        better_nodes = []
-        for node_addr in self.known_nodes:
-            if node_addr == self.address:
-                continue
-                
-            # Skip checking nodes we know are unreachable
-            if not self._validate_stub(node_addr):
-                continue
-                
-            try:
-                # Query node's score
-                node_stub = self._node_stubs.get(node_addr)
-                if node_stub:
-                    response = await asyncio.wait_for(node_stub.GetNodeStats(replication_pb2.NodeStatsRequest()), timeout=2)
-                    node_score = response.cpu_utilization  # assuming this approximates the score
-                    if node_score < my_score:
-                        better_nodes.append((node_addr, node_score))
-            except Exception:
-                continue
-        
-        # If better candidates exist, wait longer before starting election
-        if better_nodes:
-            logging.info(f"[{self.address}] Found {len(better_nodes)} better-scoring nodes, delaying election")
-            await asyncio.sleep(random.uniform(8, 12))  # Wait for better nodes to start election
-            
-            # Check if another election is already in progress
-            if self.state != "follower" or self._pre_election_delay_task is not None:
-                logging.info(f"[{self.address}] Election already started by another node, aborting")
-                return
-        
-        # Now proceed with election
-        self.state = "candidate"
-        self.current_term += 1
-        self.voted_for = self.address
-        self.votes_received = 1  # Vote for self
-        
-        # Record failed master before clearing it
-        failed_master = self.current_master_address
-        self.leader_address = None
-        self.current_master_address = None
-
-        logging.info(f"[{self.address}] Starting election for term {self.current_term}")
-
-        # Create vote request with score
-        request = replication_pb2.VoteRequest(
-            term=self.current_term,
-            candidate_id=self.address,
-            score=score_data["score"]
-        )
-
-        # Get list of alive nodes (excluding recently failed master)
-        alive_nodes = [addr for addr in self.known_nodes 
-                    if addr != failed_master and addr != self.address]
-
-        # Request votes from all known nodes
-        vote_tasks = []
-        for node_addr in alive_nodes:
-            if node_addr == failed_master:
-                logging.info(f"[{self.address}] Skipping vote request to known failed node {node_addr}")
-                continue
-            if node_addr != self.address:
-                # Skip nodes that we know are down
-                if node_addr == self.current_master_address and self.current_master_address is None:
-                    logging.info(f"[{self.address}] Skipping vote request to known failed node {node_addr}")
-                    continue
-                    
-                node_stub = self._node_stubs.get(node_addr)
-                if node_stub:
-                    try:
-                        logging.info(f"[{self.address}] Sending vote request to {node_addr}")
-                        task = asyncio.create_task(
-                            self._send_request_vote(node_stub, request, node_addr)
-                        )
-                        vote_tasks.append(task)
-                    except Exception as e:
-                        logging.error(f"[{self.address}] Error creating vote request for {node_addr}: {e}")
-
-        if not vote_tasks:
-            logging.info(f"[{self.address}] No other nodes to request votes from, becoming leader")
-            await self._become_master()
-            return
-
-        # Wait for vote responses
-        results = await asyncio.gather(*vote_tasks, return_exceptions=True)
-        for result in results:
-            if isinstance(result, Exception):
-                logging.error(f"[{self.address}] Exception during vote request: {result}")
-                continue
-                
-            if self.state != "candidate":  # If we're no longer a candidate, stop processing votes
-                return
-                
-            if result.term > self.current_term:
-                self.current_term = result.term
-                self.state = "follower"
-                self.voted_for = None
-                self.last_heartbeat_time = time.monotonic()
-                return
-                
-            if result.vote_granted:
-                self.votes_received += 1
-                logging.info(f"[{self.address}] Received vote from {result.voter_id}, total: {self.votes_received}")
-
-        # Check if we have majority
-        total_nodes = len(self.known_nodes) + 1  # +1 for self
-        if self.votes_received > total_nodes / 2:
-            logging.info(f"[{self.address}] Won election with {self.votes_received} votes out of {total_nodes}")
-            await self._become_master()
-        else:
-            # Reset to follower state
-            self.state = "follower"
-            if self._master_health_check_task is None or self._master_health_check_task.done():
-                logging.info(f"[{self.address}] Restarting master health check after failed election")
-                self._master_health_check_task = asyncio.create_task(self.check_master_health())
-                self._background_tasks.append(self._master_health_check_task)
+       
 
     def _validate_stub(self, node_addr: str) -> bool:
         """Returns True if stub is valid and connected"""
@@ -1837,26 +1884,35 @@ class Node:
         return sorted_nodes[:count]
 
     async def _become_master(self):
-        """Transitions the node to the master role."""
-        if hasattr(self, 'node_scores') and self.node_scores:
-            # Get the best node by score
-            best_node = self.get_best_nodes_by_score(1)[0]
-            
-            # If we're not the best, defer to the better node
-            if best_node != self.address and best_node in self.known_nodes:
-                logging.info(f"[{self.address}] Found better master candidate: {best_node}. Deferring leadership.")
-                self.state = "follower"
-                self.role = 'worker'
-                self.current_master_address = best_node
-                self.leader_address = best_node
-                self.last_heartbeat_time = time.monotonic()
-                
-                # Create stubs for the new master
-                self._create_master_stubs(best_node)
-                return
+        """Transitions the node to the master role and selects a backup master."""
+        # Normalize node_scores to a list of (addr, score) tuples for sorting
+        node_scores_list = []
+        if hasattr(self, "node_scores"):
+            if isinstance(self.node_scores, dict):
+                node_scores_list = list(self.node_scores.items())
+            elif isinstance(self.node_scores, list):
+                node_scores_list = self.node_scores
+        # Always include own score (in case it got missed)
+        my_score = self.calculate_server_score()["score"]
+        if self.address not in [a for a, _ in node_scores_list]:
+            node_scores_list.append((self.address, my_score))
+
+        if node_scores_list:
+            # Sort by score, lower is better
+            sorted_scores = sorted(node_scores_list, key=lambda x: x[1])
+            # For backup master selection only!
+            candidates = [addr for addr, _ in sorted_scores if addr != self.address]
+            if candidates:
+                self.backup_master_address = candidates[0]
+            else:
+                self.backup_master_address = self.address  # Only self if no one else
+            logging.info(f"[{self.address}] Elected backup master: {self.backup_master_address}")
+        else:
+            # Only self in cluster
+            self.backup_master_address = self.address
 
         logging.info(f"[{self.address}] Becoming master for term {self.current_term}.")
-        self.role = 'master'
+        self.role = "master"
         self.state = "leader"
         self.leader_address = self.address
         self.current_master_address = self.address
@@ -1888,6 +1944,7 @@ class Node:
             self._other_nodes_health_check_task = asyncio.create_task(self._check_other_nodes_health())
             self._background_tasks.append(self._other_nodes_health_check_task)
 
+
     async def _send_request_vote(self, node_stub: replication_pb2_grpc.NodeServiceStub, request: replication_pb2.VoteRequest, node_address: str) -> replication_pb2.VoteResponse:
         """Sends a RequestVote RPC to a node."""
         try:
@@ -1903,34 +1960,28 @@ class Node:
 
     async def _master_election_announcement_routine(self):
         """Periodically announces this node as the master."""
-
         while self.role == 'master':  # Keep announcing while master
             logging.info(f"[{self.address}] Announcing self as master (Term: {self.current_term}).")
             announcement = replication_pb2.MasterAnnouncement(
                 master_address=self.address,
+                backup_master_address=self.backup_master_address or "",
                 node_id_of_master=self.id,
                 term=self.current_term
             )
-
-            announcement_tasks = []
+            # Send announcement to all nodes
             for node_addr in list(self._node_stubs):
                 if node_addr == self.address:
                     continue
                 try:
                     await self._send_master_announcement(node_addr, announcement)
-                except (grpc.aio.AioRpcError, asyncio.TimeoutError) as e:
-                    logging.warning(f"[{self.address}] MasterAnnouncement to {node_addr} failed: {e}. Removing from cluster.")
-                    # prune it
+                except Exception as e:
+                    logging.warning(f"[{self.address}] MasterAnnouncement to {node_addr} failed: {e}")
                     self._node_stubs.pop(node_addr, None)
                     self._worker_stubs.pop(node_addr, None)
                     self._channels.pop(node_addr, None)
-                  
-
-            if announcement_tasks:
-                await asyncio.gather(*announcement_tasks, return_exceptions=True)
-
-            await asyncio.sleep(5)  # Adjust interval as needed
+            await asyncio.sleep(5)
         logging.info(f"[{self.address}] Master announcement routine stopped.")
+
 
     async def _send_master_announcement(self, node_address: str, announcement: replication_pb2.MasterAnnouncement):
         """Sends a MasterAnnouncement RPC to a node."""
@@ -1989,59 +2040,55 @@ class Node:
             logging.info(f"[{self.address}] Pre-election delay cancelled.")
 
 
-    async def retry_register_with_master(self, interval: float = 5.0):
-        """Periodically attempts to register with master if not yet successful."""
-        while self.role == 'worker':
-            try:
-                # Ensure the master stub exists or recreate it if needed
-                if not self.master_stub:
-                    self._create_master_stubs(self.current_master_address)
-                       # Build and send the registration request to the master
-                req = replication_pb2.RegisterWorkerRequest(worker_address=self.address)
-                resp = await self.master_stub.RegisterWorker(req)
-                if resp.success:
-                    logging.info(f"[{self.address}] Successfully registered with master on retry: {resp.message}")
-                    return  # Stop retrying after success
-                else:
-                    logging.info(f"[{self.address}] Retry registration response: {resp.message}")
-            except Exception as e:
-                logging.warning(f"[{self.address}] Retry register failed: {e}")
-            await asyncio.sleep(interval)
+   
 
     async def check_master_health(self):
-        """Periodically checks the health of the master node."""
-        while self.role == 'worker': 
+        """Periodically checks the health of the master node. If no master is known for a timeout, triggers election."""
+        time_no_master_started = None  # When did we first lose our master?
+        while self.role == 'worker':
             if not self.current_master_address:
-                logging.info(f"[{self.address}] No master known, waiting briefly before checking again")
+                # Start the no-master timer if not already started
+                if time_no_master_started is None:
+                    time_no_master_started = time.monotonic()
+                elapsed = time.monotonic() - time_no_master_started
+                logging.info(f"[{self.address}] No master known, waiting briefly before checking again ({elapsed:.1f}s)")
+
+                # If we've been without a master longer than the election timeout, start an election!
+                if elapsed > self.election_timeout:
+                    logging.info(f"[{self.address}] No master detected for {elapsed:.1f}s (>{self.election_timeout:.1f}s). Starting election.")
+                    await self._start_election_with_delay()
+                    time_no_master_started = None  # Reset timer
                 await asyncio.sleep(2)
                 continue
+            else:
+                # If we know a master, reset the no-master timer
+                time_no_master_started = None
+
             try:
                 # Get a NodeServiceStub for the master
                 master_node_channel = self._get_or_create_channel(self.current_master_address)
                 if not master_node_channel:
                     logging.warning(f"[{self.address}] Could not get channel to master at {self.current_master_address} for health check.")
                     self.current_master_address = None  # Clear the master address
-                    await self._start_election_with_delay()  # Start election
                     continue  # Continue the loop instead of returning
-                    
-                master_node_stub = replication_pb2_grpc.NodeServiceStub(master_node_channel)
 
+                master_node_stub = replication_pb2_grpc.NodeServiceStub(master_node_channel)
                 response = await asyncio.wait_for(
                     master_node_stub.GetNodeStats(replication_pb2.NodeStatsRequest()),
                     timeout=5
                 )
-                
-                # Update our knowledge of the network based on master's stats
+
+                # Update knowledge of the network based on master's stats
                 if response.known_nodes_count > len(self.known_nodes) + 1:  # +1 for self
                     logging.info(f"[{self.address}] Master knows more nodes than we do. Requesting update.")
                     await self._request_node_list_update(master_node_stub)
-                    
+
                 logging.debug(f"[{self.address}] Master at {self.current_master_address} is healthy.")
                 self.last_heartbeat_time = time.monotonic()  # Update heartbeat
             except (grpc.aio.AioRpcError, asyncio.TimeoutError) as e:
                 logging.error(f"[{self.address}] Master unreachable: {e}")
                 time_since_last_heartbeat = time.monotonic() - self.last_heartbeat_time
-                
+
                 if time_since_last_heartbeat > self.election_timeout:
                     # Remove failed master from all tracking
                     failed_master = self.current_master_address
@@ -2052,15 +2099,16 @@ class Node:
                     if failed_master in self._channels:
                         await self._channels[failed_master].close()
                         del self._channels[failed_master]
-                    
+
                     self.current_master_address = None
                     logging.info(f"[{self.address}] Init election after master {failed_master} removal")
                     await self._start_election_with_delay()
-                    # break
+                    time_no_master_started = None  # Reset timer
             except Exception as e:
                 logging.error(f"[{self.address}] Error checking master health: {e}", exc_info=True)
-            await asyncio.sleep(2)  # Adjust as needed
+            await asyncio.sleep(2)
         logging.info(f"[{self.address}] Master health check routine stopped.")
+
 
     async def _request_node_list_update(self, master_node_stub):
         """Request an updated node list from the master."""
@@ -2087,7 +2135,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Distributed Video Encoding Node")
     parser.add_argument("--host", type=str, default="localhost", help="Host address to bind the server to")
     parser.add_argument("--port", type=int, required=True, help="Port to bind the server to")
-    parser.add_argument("--role", type=str, choices=['master', 'worker'], required=True, help="Role of the node (master or worker)")
+    parser.add_argument("--role", type=str, choices=['master', 'backup_master', 'worker'], required=True, help="Role of the node (master, backup_master, or worker)")
     parser.add_argument("--master", type=str, help="Address of the initial master node (host:port). Required for workers.")
     parser.add_argument("--nodes", type=str, nargs='*', default=[], help="List of known node addresses (host:port) in the network.")
 

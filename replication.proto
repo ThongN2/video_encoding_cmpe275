@@ -143,6 +143,7 @@ message MasterAnnouncement {
   string master_address = 1;  // e.g., "host:port"
   string node_id_of_master = 2; // Unique ID of the node that is master
   int32 term = 3; // The current term of the master
+  string backup_master_address = 4;
 }
 
 message MasterAnnouncementResponse {
@@ -161,6 +162,7 @@ message VoteResponse {
   int32 term = 1;
   bool vote_granted = 2;
   string voter_id = 3;
+  double voter_score = 4;
 }
 
 message ResourceScoreRequest {
