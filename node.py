@@ -112,7 +112,7 @@ class Node:
 
             asyncio.create_task(self.retry_register_with_master())
 
-        if self.role == 'master' and backup_servers:
+        if backup_servers:
             self.backup_servers = backup_servers
             logging.info(f"[{self.address}] Backup servers: {self.backup_servers}")
 
@@ -1807,6 +1807,41 @@ class Node:
         if self._other_nodes_health_check_task is None or self._other_nodes_health_check_task.done():
             self._other_nodes_health_check_task = asyncio.create_task(self._check_other_nodes_health())
             self._background_tasks.append(self._other_nodes_health_check_task)
+        
+        # Attempt to restore data from backup servers
+        restored = await self._restore_from_backup_servers()
+        
+        # If remote restoration failed, check local backup
+        if not restored:
+            logging.info(f"[{self.address}] Remote backup restoration failed or not available. Checking local backup.")
+            backup_dir = os.path.join(MASTER_DATA_DIR, 'backup')
+            if os.path.exists(backup_dir):
+                logging.info(f"[{self.address}] Found local backup directory, attempting to restore data")
+                try:
+                    # Copy all files from backup to MASTER_DATA_DIR
+                    for file in os.listdir(backup_dir):
+                        src_path = os.path.join(backup_dir, file)
+                        dst_path = os.path.join(MASTER_DATA_DIR, file)
+                        if os.path.isfile(src_path):
+                            shutil.copy2(src_path, dst_path)
+                            
+                            # Update video status tracking if it's a processed video
+                            if "_processed." in file:
+                                video_id = file.split('_processed')[0]
+                                container = file.split('.')[-1]
+                                self.video_statuses[video_id] = {
+                                    "status": "completed",
+                                    "processed_video_path": dst_path,
+                                    "container": container,
+                                    "shards": {},
+                                    "retrieved_shards": {}
+                                }
+                                
+                            logging.info(f"[{self.address}] Restored local backup file: {file}")
+                except Exception as e:
+                    logging.error(f"[{self.address}] Error restoring local backup data: {e}")
+            else:
+                logging.info(f"[{self.address}] No local backup directory found at {backup_dir}")
 
     async def _send_request_vote(self, node_stub: replication_pb2_grpc.NodeServiceStub, request: replication_pb2.VoteRequest, node_address: str) -> replication_pb2.VoteResponse:
         """Sends a RequestVote RPC to a node."""
@@ -2061,6 +2096,106 @@ class Node:
                 success=False,
                 message=str(e)
             )
+
+    async def RequestBackupData(self, request: replication_pb2.RequestBackupDataRequest, context: grpc.aio.ServicerContext) -> replication_pb2.RequestBackupDataResponse:
+        """Handles backup data requests from a new master."""
+        try:
+            backup_dir = os.path.join(MASTER_DATA_DIR, "backup")
+            if not os.path.exists(backup_dir):
+                return replication_pb2.RequestBackupDataResponse(
+                    success=False,
+                    message="No backup directory found",
+                    backup_files=[]
+                )
+            
+            backup_files = []
+            for filename in os.listdir(backup_dir):
+                file_path = os.path.join(backup_dir, filename)
+                if os.path.isfile(file_path):
+                    with open(file_path, 'rb') as f:
+                        file_data = f.read()
+                    video_id = filename.split('_processed')[0]
+                    container = filename.split('.')[-1]
+                    backup_files.append(replication_pb2.BackupFile(
+                        video_id=video_id,
+                        file_data=file_data,
+                        container=container,
+                        filename=filename
+                    ))
+            
+            logging.info(f"[{self.address}] Sending {len(backup_files)} backup files to new master")
+            return replication_pb2.RequestBackupDataResponse(
+                success=True,
+                message=f"Successfully retrieved {len(backup_files)} backup files",
+                backup_files=backup_files
+            )
+            
+        except Exception as e:
+            logging.error(f"[{self.address}] Failed to retrieve backup data: {e}")
+            return replication_pb2.RequestBackupDataResponse(
+                success=False,
+                message=f"Failed to retrieve backup data: {e}",
+                backup_files=[]
+            )
+
+    async def _restore_from_backup_servers(self):
+        """Retrieves backup data from backup servers."""
+        if not hasattr(self, 'backup_servers') or not self.backup_servers:
+            logging.warning(f"[{self.address}] No backup servers configured for restoration")
+            return
+            
+        logging.info(f"[{self.address}] Attempting to restore data from {len(self.backup_servers)} backup servers")
+        
+        for backup_addr in self.backup_servers:
+            if backup_addr == self.address:
+                logging.info(f"[{self.address}] Skipping self as backup server")
+                continue
+                
+            try:
+                # Get or create channel to backup server
+                channel = self._get_or_create_channel(backup_addr)
+                backup_stub = replication_pb2_grpc.NodeServiceStub(channel)
+                
+                # Request backup data
+                request = replication_pb2.RequestBackupDataRequest(
+                    new_master_address=self.address
+                )
+                
+                # Send to backup server
+                response = await asyncio.wait_for(
+                    backup_stub.RequestBackupData(request),
+                    timeout=30  # Longer timeout for potentially large data
+                )
+                
+                if response.success and response.backup_files:
+                    logging.info(f"[{self.address}] Received {len(response.backup_files)} backup files from {backup_addr}")
+                    
+                    # Process the backup files
+                    for backup_file in response.backup_files:
+                        output_path = os.path.join(MASTER_DATA_DIR, backup_file.filename)
+                        with open(output_path, 'wb') as f:
+                            f.write(backup_file.file_data)
+                        
+                        # Update video status tracking
+                        video_id = backup_file.video_id
+                        self.video_statuses[video_id] = {
+                            "status": "completed",
+                            "processed_video_path": output_path,
+                            "container": backup_file.container,
+                            "shards": {},
+                            "retrieved_shards": {}
+                        }
+                        
+                        logging.info(f"[{self.address}] Restored backup file for video {video_id}")
+                    
+                    return True  # Successfully restored from this backup server
+                else:
+                    logging.warning(f"[{self.address}] No backup files from {backup_addr}: {response.message}")
+                    
+            except Exception as e:
+                logging.error(f"[{self.address}] Error restoring from backup server {backup_addr}: {e}")
+                
+        return False  # Couldn't restore from any backup server
 
 async def serve(host: str, port: int, role: str, master_address: Optional[str], known_nodes: List[str], backup_servers: List[str]):
     """Starts the gRPC server and initializes the node."""
