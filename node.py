@@ -1419,7 +1419,7 @@ class Node:
         finally:
 
             if process_dir and os.path.exists(process_dir):
-                 await asyncio.get_event_loop().run_in_executor(None, shutil.rmtree, process_dir, ignore_errors=True)
+                 await asyncio.get_event_loop().run_in_executor(None, shutil.rmtree, process_dir)
 
 
     def _run_ffmpeg_processing(self, input_path, target_w, target_h, output_path):
@@ -1605,10 +1605,40 @@ class Node:
 
             await asyncio.sleep(HEALTH_INTERVAL + random.uniform(0, JITTER))
 
+    async def _prune_unreachable_nodes(self, timeout: float = 1.0):
+        """
+        Ping each known node with GetNodeStats(timeout).
+        Remove from known_nodes, _node_stubs, _worker_stubs, and _channels if unresponsive.
+        """
+        for node in list(self.known_nodes):
+            stub = self._node_stubs.get(node)
+            if stub is None:
+                try:
+                    self._create_stubs_for_node(node)
+                    stub = self._node_stubs.get(node)
+                except Exception:
+                    pass
+
+            if stub:
+                try:
+                    await asyncio.wait_for(
+                        stub.GetNodeStats(replication_pb2.NodeStatsRequest()), timeout
+                    )
+                except Exception:
+                    logging.warning(f"[{self.address}] Pruning unreachable node {node}")
+                    self.known_nodes.remove(node)
+                    self._node_stubs.pop(node, None)
+                    self._worker_stubs.pop(node, None)
+                    ch = self._channels.pop(node, None)
+                    if ch:
+                        await ch.close()
+
     async def start_election(self):
         """Initiates leader election with improved coordination"""
         if self.state == "leader":
             return
+        
+        await self._prune_unreachable_nodes()
         
         # Calculate our score
         score_data = self.calculate_server_score()
@@ -1780,7 +1810,9 @@ class Node:
         self.state = "leader"
         self.leader_address = self.address
         self.current_master_address = self.address
-
+        
+        # Generate the master_data directory if it doesn't already exist once a node becomes a leader
+        os.makedirs(MASTER_DATA_DIR, exist_ok=True)
 
         if not self._master_service_added:
             replication_pb2_grpc.MasterServiceServicer.__init__(self)
