@@ -205,6 +205,70 @@ class Node:
         except Exception as e:
             logging.error(f"[{self.address}] Failed to register with master: {e}")
 
+    async def _broadcast_discovery_message(self):
+        """Broadcasts discovery message to find existing workers in the network."""
+        logging.info(f"[{self.address}] Broadcasting master presence to discover existing workers")
+        
+        # 1. First, check all known nodes 
+        for node_addr in list(self.known_nodes):
+            if node_addr == self.address:
+                continue
+                
+            try:
+                node_stub = self._node_stubs.get(node_addr)
+                if not node_stub:
+                    self._create_stubs_for_node(node_addr)
+                    node_stub = self._node_stubs.get(node_addr)
+                    
+                if node_stub:
+                    # Send announcement to this node
+                    announcement = replication_pb2.MasterAnnouncement(
+                        master_address=self.address,
+                        backup_master_address=self.backup_master_address or "",
+                        node_id_of_master=self.id,
+                        term=self.current_term
+                    )
+                    
+                    response = await asyncio.wait_for(
+                        node_stub.AnnounceMaster(announcement),
+                        timeout=3
+                    )
+                    
+                    logging.info(f"[{self.address}] Node {node_addr} acknowledged discovery: {response.status}")
+                    
+                    # Also get node stats to see if it's a worker
+                    stats = await asyncio.wait_for(
+                        node_stub.GetNodeStats(replication_pb2.NodeStatsRequest()),
+                        timeout=2
+                    )
+                    
+                    if not stats.is_master:
+                        # This is a worker - ensure we have worker stubs
+                        if node_addr not in self._worker_stubs:
+                            logging.info(f"[{self.address}] Found worker at {node_addr}, creating worker stub")
+                            self._create_stubs_for_node(node_addr)
+                            
+                        # Try to force-trigger worker registration
+                        announcement_update = replication_pb2.UpdateNodeListRequest(
+                            node_addresses=[self.address] + self.known_nodes,
+                            master_address=self.address
+                        )
+                        
+                        await asyncio.wait_for(
+                            node_stub.UpdateNodeList(announcement_update),
+                            timeout=3
+                        )
+                        
+            except Exception as e:
+                logging.warning(f"[{self.address}] Error during discovery broadcast to {node_addr}: {e}")
+                
+        # 2. Try scanning for additional nodes on network (optional - use if you're on a local network)
+        # This is optional and would need customization for your network configuration
+        
+        logging.info(f"[{self.address}] Master discovery broadcast completed")
+
+    # Removed duplicate or misplaced docstring and function body to fix indentation error.
+
     async def start(self):
         """Starts the gRPC server and background routines."""
         server_options = [
@@ -304,6 +368,8 @@ class Node:
                 for node_addr in self.known_nodes:
                     if node_addr != self.address:
                         self._create_stubs_for_node(node_addr)
+                    
+                await self._broadcast_discovery_message()
 
                 logging.info(f"[{self.address}] Starting master announcement routine.")
                 t1 = asyncio.create_task(self._master_election_announcement_routine())
@@ -485,6 +551,7 @@ class Node:
             logging.info(f"[{self.address}] Starting master health check routine as {self.role}.")
             self._master_health_check_task = asyncio.create_task(self.check_master_health())
             self._background_tasks.append(self._master_health_check_task)
+            asyncio.create_task(self.retry_register_with_master())
 
         # Reset election attempt counter since we have a valid master
         self.election_attempts = 0
@@ -2246,12 +2313,15 @@ class Node:
                 if no_master_retry_count % 3 == 0:  # Every 3rd retry
                     logging.info(f"[{self.address}] Attempting active master discovery during health check")
                     discovered = await self.discover_current_master()
-                    if discovered:
-                        # Reset timer since we found a master
-                        logging.info(f"[{self.address}] Successfully discovered master during health check")
+                    
+                    # If discovery successful, attempt to register with newly found master
+                    if discovered and self.current_master_address:
+                        logging.info(f"[{self.address}] Successfully discovered master during health check - registering")
+                        self._create_master_stubs(self.current_master_address)
+                        asyncio.create_task(self.retry_register_with_master())  # Register with discovered master
                         time_no_master_started = None
                         no_master_retry_count = 0
-                        await asyncio.sleep(2)
+                        time.sleep(2)
                         continue
 
                 # Backup master gets priority with a much shorter timeout
@@ -2292,6 +2362,11 @@ class Node:
                 # Health check passed
                 logging.debug(f"[{self.address}] Master at {self.current_master_address} is healthy.")
                 self.last_heartbeat_time = time.monotonic()  # Update heartbeat
+                
+                # Make sure we're registered with the master
+                if self.role == 'worker' and no_master_retry_count % 10 == 0:  # Periodically re-register
+                    await self.retry_register_with_master()
+                    
             except Exception as e:
                 logging.error(f"[{self.address}] Master unreachable: {e}")
                 time_since_last_heartbeat = time.monotonic() - self.last_heartbeat_time
