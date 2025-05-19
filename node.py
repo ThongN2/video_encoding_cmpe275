@@ -68,7 +68,6 @@ class Node:
         self._master_announcement_task: Optional[asyncio.Task] = None
         self._other_nodes_health_check_task: Optional[asyncio.Task] = None
         self._master_health_check_task: Optional[asyncio.Task] = None
-        self._fail_counts = defaultdict(int)  # used for pre-election topology check
 
         self.node_scores = {}
         self.score_last_updated = 0
