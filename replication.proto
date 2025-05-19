@@ -163,6 +163,8 @@ message VoteResponse {
   bool vote_granted = 2;
   string voter_id = 3;
   double voter_score = 4;
+  string current_master_address = 5;
+  bool has_master = 6;
 }
 
 message ResourceScoreRequest {
